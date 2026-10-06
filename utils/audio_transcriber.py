@@ -5,9 +5,11 @@ from dotenv import load_dotenv
 from google.cloud import storage
 from google.cloud.speech_v2 import SpeechClient
 from google.cloud.speech_v2.types import cloud_speech
+import imageio_ffmpeg
 import os
 import subprocess
 import tempfile
+import time
 from typing import Any
 
 # Load Env Vars
@@ -35,6 +37,8 @@ def _extract_and_upload_temp_audio(
     3. Uploads temp_audio.flac to GCS for Speech-to-Text V2 BatchRecognize.
     4. Cleans up local temp files immediately.
     """
+    
+    # Download Video from gcs
     bucket = gcs_client.bucket(bucket_name)
     video_blob = bucket.blob(video_blob_path)
 
@@ -44,10 +48,11 @@ def _extract_and_upload_temp_audio(
 
         # 1. Download video from GCS
         video_blob.download_to_filename(local_video_path)
+        print(f"  [1a] Downloaded {video_blob_path} from GCS...", flush=True)
 
         # 2. Extract lightweight mono 16kHz FLAC audio via ffmpeg
         ffmpeg_cmd = [
-            "ffmpeg",
+            imageio_ffmpeg.get_ffmpeg_exe(),
             "-y",                   # Overwrite output if exists
             "-i", local_video_path, # Input video file
             "-vn",                  # Drop video stream (audio only)
@@ -61,10 +66,12 @@ def _extract_and_upload_temp_audio(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        print("  [1b] Extracted 16kHz mono FLAC audio via ffmpeg...", flush=True)
 
         # 3. Upload extracted audio to GCS
         audio_blob = bucket.blob(audio_blob_path)
         audio_blob.upload_from_filename(local_audio_path, content_type="audio/flac")
+        print("  [1c] Uploaded temp_audio.flac to GCS...", flush=True)
 
     return f"gs://{bucket_name}/{audio_blob_path}"
 
@@ -78,7 +85,6 @@ def _run_batch_recognize(audio_gcs_uri: str) -> tuple[str, list[dict[str, Any]]]
     and returns (full_transcript, list_of_word_timestamps).
     """
     recognizer_path = f"projects/{GCP_PROJECT_ID}/locations/global/recognizers/_"
-
     config = cloud_speech.RecognitionConfig(
         auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
         language_codes=["en-US"],
@@ -88,7 +94,6 @@ def _run_batch_recognize(audio_gcs_uri: str) -> tuple[str, list[dict[str, Any]]]
             enable_automatic_punctuation=True,
         ),
     )
-
     request = cloud_speech.BatchRecognizeRequest(
         recognizer=recognizer_path,
         config=config,
@@ -97,27 +102,37 @@ def _run_batch_recognize(audio_gcs_uri: str) -> tuple[str, list[dict[str, Any]]]
             inline_response_config=cloud_speech.InlineOutputConfig()
         ),
     )
-
-    # Long-running operation: waits for Speech-to-Text V2 to finish
+    
+    # Start the async BatchRecognize job and poll progress every 10s
+    print("  [1d] Starting Speech-to-Text V2 BatchRecognize job...", flush=True)
     operation = speech_client.batch_recognize(request=request)
-    response = operation.result(timeout=3600)
+    start_wait = time.time()
+    while not operation.done():
+        elapsed = int(time.time() - start_wait)
+        progress_str = "queued/running"
+        print(
+            f"  [1d] Speech-to-Text V2 progress: {progress_str} (elapsed: {elapsed}s)",
+            flush=True,
+        )
+        time.sleep(10)
+    
+    response = operation.result(timeout=60)
     if response is None:
         raise RuntimeError("Speech-to-Text V2 returned an empty response.")
-
+    
     file_result = response.results[audio_gcs_uri]
     if file_result.error and file_result.error.code != 0:
         raise RuntimeError(f"Speech-to-Text V2 error: {file_result.error.message}")
-
+    
     transcript_parts: list[str] = []
     words: list[dict[str, Any]] = []
-
-    for result in file_result.transcript.results:
+    transcript_obj = file_result.inline_result.transcript or file_result.transcript
+    for result in transcript_obj.results:
         if not result.alternatives:
             continue
         best_alt = result.alternatives[0]
         if best_alt.transcript:
             transcript_parts.append(best_alt.transcript.strip())
-
         for word_info in best_alt.words:
             start_sec = word_info.start_offset.total_seconds()
             end_sec = word_info.end_offset.total_seconds()
@@ -126,8 +141,9 @@ def _run_batch_recognize(audio_gcs_uri: str) -> tuple[str, list[dict[str, Any]]]
                 "start_sec": round(start_sec, 3),
                 "end_sec": round(end_sec, 3),
             })
-
     full_transcript = " ".join(transcript_parts)
+    
+    print(f"  [1d] Transcription complete! Extracted {len(words)} words.", flush=True)
     return full_transcript, words
 
 ################################################################

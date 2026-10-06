@@ -14,10 +14,14 @@ load_dotenv()
 EMBEDDING_MODEL = "gemini-embedding-2"
 SEGMENT_INTERVAL_SEC = 30
 
+# MAC ONLY
+os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
+
 # Set up client
 client = genai.Client(
+    vertexai=True,
     project=os.environ['GCP_PROJECT_ID'],
-    location=os.environ['GCP_REGION']
+    location='global'
 )
 
 ################################################################
@@ -51,6 +55,7 @@ def _embed_video_segment(
     response = client.models.embed_content(
         model=EMBEDDING_MODEL,
         contents=[content],
+        config=types.EmbedContentConfig(output_dimensionality=1408),
     )
 
     # return response embeddings
@@ -72,6 +77,7 @@ def _embed_text_snippet(text: str) -> list[float] | None:
     response = client.models.embed_content(
         model=EMBEDDING_MODEL,
         contents=[cleaned],
+        config=types.EmbedContentConfig(output_dimensionality=1408),
     )
     if not response.embeddings:
         return None
@@ -100,9 +106,15 @@ def build_multimodal_segments(
 
     segment_index = 0
     start_sec = 0
+    total_segments = (effective_duration + SEGMENT_INTERVAL_SEC - 1) // SEGMENT_INTERVAL_SEC
 
     while start_sec < effective_duration:
         end_sec = min(start_sec + SEGMENT_INTERVAL_SEC, effective_duration)
+        print(
+            f"  [2/4] Embedding segment {segment_index + 1}/{total_segments} "
+            f"({start_sec}s - {end_sec}s) with {EMBEDDING_MODEL}...",
+            flush=True,
+        )
 
         # 1. Embed the video frames for [start_sec, end_sec]
         video_embedding = _embed_video_segment(
