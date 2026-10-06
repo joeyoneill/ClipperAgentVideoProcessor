@@ -1,6 +1,7 @@
 # processor/video_embedder.py
 
 # Imports
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -13,6 +14,7 @@ load_dotenv()
 # Constants
 EMBEDDING_MODEL = "gemini-embedding-2"
 SEGMENT_INTERVAL_SEC = 30
+MAX_EMBED_WORKERS = 8
 
 # MAC ONLY
 os.environ["GOOGLE_API_USE_CLIENT_CERTIFICATE"] = "false"
@@ -67,6 +69,7 @@ def _embed_video_segment(
 ################################################################
 # Embed the Transcript Text for that Window
 ################################################################
+
 def _embed_text_snippet(text: str) -> list[float] | None:
     """
     Embeds the spoken transcript for a time window using gemini-embedding-2.
@@ -85,56 +88,93 @@ def _embed_text_snippet(text: str) -> list[float] | None:
     return list(first_embedding.values) if first_embedding.values else None
 
 ################################################################
-# Step C: Build All Multimodal Segments for a Video
+# Parallel Video Window Embeddings
 ################################################################
 
-def build_multimodal_segments(
+def embed_video_windows_parallel(
+    gcs_uri: str,
+    mime_type: str,
+    total_duration_sec: int,
+) -> dict[int, list[float] | None]:
+    """
+    Splits the video timeline into 30s windows and embeds 8 windows concurrently
+    using gemini-embedding-2. Returns {segment_index: video_embedding}.
+    """
+    effective_duration = max(total_duration_sec, 1)
+
+    # Build list of (segment_index, start_sec, end_sec)
+    windows: list[tuple[int, int, int]] = []
+    seg_idx = 0
+    start_sec = 0
+    while start_sec < effective_duration:
+        end_sec = min(start_sec + SEGMENT_INTERVAL_SEC, effective_duration)
+        windows.append((seg_idx, start_sec, end_sec))
+        seg_idx += 1
+        start_sec = end_sec
+
+    total_segments = len(windows)
+    video_embeddings: dict[int, list[float] | None] = {}
+    completed_count = 0
+
+    def _worker(win: tuple[int, int, int]) -> tuple[int, list[float] | None]:
+        idx, s_sec, e_sec = win
+        emb = _embed_video_segment(gcs_uri, mime_type, s_sec, e_sec)
+        return idx, emb
+
+    with ThreadPoolExecutor(max_workers=MAX_EMBED_WORKERS) as executor:
+        futures = {executor.submit(_worker, w): w for w in windows}
+        for future in as_completed(futures):
+            idx, emb = future.result()
+            video_embeddings[idx] = emb
+            completed_count += 1
+            if completed_count % 10 == 0 or completed_count == total_segments:
+                print(
+                    f"  [Video Embed] Completed {completed_count}/{total_segments} video segments...",
+                    flush=True,
+                )
+
+    return video_embeddings
+
+################################################################
+# Build All Multimodal Segments for a Video (Parallel)
+################################################################
+
+def build_multimodal_segments_parallel(
     uid: str,
     video_id: str,
     gcs_uri: str,
     mime_type: str,
     total_duration_sec: int,
     words: list[dict[str, Any]],
+    precomputed_video_embeddings: dict[int, list[float] | None] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Steps through the video in 30-second virtual windows, pairing each window's
-    gemini-embedding-2 video embedding with its aligned Speech-to-Text words
-    and text embedding.
+    Combines 30s video embeddings with aligned Speech-to-Text words and
+    parallel-embedded text vectors, returning segments ordered by segment_index.
     """
     effective_duration = max(total_duration_sec, 1)
-    segments: list[dict[str, Any]] = []
 
+    # 1. Use precomputed video embeddings if provided, otherwise compute in parallel now
+    video_embeddings = (
+        precomputed_video_embeddings
+        if precomputed_video_embeddings is not None
+        else embed_video_windows_parallel(gcs_uri, mime_type, effective_duration)
+    )
+
+    # 2. Group words into each 30s window
+    window_Payloads: list[dict[str, Any]] = []
     segment_index = 0
     start_sec = 0
-    total_segments = (effective_duration + SEGMENT_INTERVAL_SEC - 1) // SEGMENT_INTERVAL_SEC
 
     while start_sec < effective_duration:
         end_sec = min(start_sec + SEGMENT_INTERVAL_SEC, effective_duration)
-        print(
-            f"  [2/4] Embedding segment {segment_index + 1}/{total_segments} "
-            f"({start_sec}s - {end_sec}s) with {EMBEDDING_MODEL}...",
-            flush=True,
-        )
-
-        # 1. Embed the video frames for [start_sec, end_sec]
-        video_embedding = _embed_video_segment(
-            gcs_uri=gcs_uri,
-            mime_type=mime_type,
-            start_sec=start_sec,
-            end_sec=end_sec,
-        )
-
-        # 2. Grab all words from Speech-to-Text V2 spoken in [start_sec, end_sec)
         segment_words = [
             w for w in words
             if w["start_sec"] >= float(start_sec) and w["start_sec"] < float(end_sec)
         ]
         transcript_text = " ".join(w["word"] for w in segment_words).strip()
 
-        # 3. Embed the spoken transcript text in the same gemini-embedding-2 space
-        text_embedding = _embed_text_snippet(transcript_text)
-
-        segments.append({
+        window_Payloads.append({
             "video_id": video_id,
             "uid": uid,
             "segment_index": segment_index,
@@ -142,11 +182,26 @@ def build_multimodal_segments(
             "end_sec": float(end_sec),
             "transcript_text": transcript_text,
             "words": segment_words,
-            "video_embedding": video_embedding,
-            "text_embedding": text_embedding,
+            "video_embedding": video_embeddings.get(segment_index),
         })
 
         segment_index += 1
         start_sec = end_sec
 
+    # 3. Embed all transcript text snippets in parallel (8 at a time)
+    total_segments = len(window_Payloads)
+    print(f"  [Text Embed] Embedding {total_segments} text windows in parallel...", flush=True)
+
+    def _text_worker(item: dict[str, Any]) -> dict[str, Any]:
+        item["text_embedding"] = _embed_text_snippet(item["transcript_text"])
+        return item
+
+    segments: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=MAX_EMBED_WORKERS) as executor:
+        futures = [executor.submit(_text_worker, item) for item in window_Payloads]
+        for future in as_completed(futures):
+            segments.append(future.result())
+
+    # Sort back into chronological order (0, 1, 2, ...) since threads finish out of order
+    segments.sort(key=lambda s: s["segment_index"])
     return segments

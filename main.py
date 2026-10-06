@@ -2,6 +2,7 @@
 
 # Imports
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.cloud import firestore
@@ -14,7 +15,7 @@ from typing import Any
 from utils.db import db
 from utils.audio_transcriber import transcribe_video_from_gcs
 from utils.storage import gcs_client
-from utils.video_embedder import build_multimodal_segments
+from utils.video_embedder import build_multimodal_segments_parallel, embed_video_windows_parallel
 
 # Load Env Vars
 load_dotenv()
@@ -144,48 +145,68 @@ def process_video(video_id: str, uid: str) -> None:
         mime_type: str = video_data.get("content_type") or "video/mp4"
         duration_sec: int = int(video_data.get("duration_seconds") or 30)
 
-        # Load from GCS checkpoint if it exists, otherwise run Speech-to-Text V2
-        checkpoint = load_transcript_checkpoint(uid=uid, video_id=video_id)
-        if checkpoint is not None:
-            full_transcript, words = checkpoint
-            print(
-                f"[1/4] Loaded saved transcript checkpoint from GCS "
-                f"({len(words)} words) — skipping Speech-to-Text!",
-                flush=True,
-            )
-        else:
+        # Helper for Branch 1: Load transcript checkpoint from GCS or run Speech-to-Text V2
+        def _run_transcription_step() -> tuple[str, list[dict[str, Any]]]:
+            checkpoint = load_transcript_checkpoint(uid=uid, video_id=video_id)
+            if checkpoint is not None:
+                t_text, t_words = checkpoint
+                print(
+                    f"[1/4] Loaded saved transcript checkpoint from GCS "
+                    f"({len(t_words)} words) — skipping Speech-to-Text!",
+                    flush=True,
+                )
+                return t_text, t_words
+
             print(f"[1/4] Transcribing audio & word timestamps for video {video_id}...", flush=True)
-            full_transcript, words = transcribe_video_from_gcs(
+            t_text, t_words = transcribe_video_from_gcs(
                 uid=uid,
                 video_id=video_id,
                 video_blob_path=video_blob_path,
             )
-            # Save checkpoint to GCS & Firestore immediately so we never re-run [1/4]
-            save_transcript_checkpoint(uid, video_id, full_transcript, words)
+            save_transcript_checkpoint(uid, video_id, t_text, t_words)
             doc_ref.update({
-                "transcript": full_transcript,
+                "transcript": t_text,
                 "updated_at": get_utc_now(),
             })
             print("[1/4] Saved transcript checkpoint to GCS & Firestore.", flush=True)
+            return t_text, t_words
+
+        # Run Step 1 (Audio Transcription) AND Step 2a (Video Frame Embeddings) at the SAME time!
+        print(
+            f"[1/4 & 2/4] Running Audio Transcription and Video Embeddings in parallel for {video_id}...",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stt_future = executor.submit(_run_transcription_step)
+            video_embed_future = executor.submit(
+                embed_video_windows_parallel,
+                gcs_uri,
+                mime_type,
+                duration_sec,
+            )
+            full_transcript, words = stt_future.result()
+            video_embeddings = video_embed_future.result()
 
         # If client didn't know duration, fallback to the last spoken word's timestamp
         if not video_data.get("duration_seconds") and words:
             duration_sec = max(duration_sec, int(words[-1]["end_sec"]) + 1)
 
-        print(f"[2/4] Generating gemini-embedding-2 segments for video {video_id}...")
-        segments = build_multimodal_segments(
+        # Step 2b: Align words to 30s windows, attach video_embeddings, and embed text in parallel
+        print(f"[2/4] Aligning words & embedding text windows for video {video_id}...", flush=True)
+        segments = build_multimodal_segments_parallel(
             uid=uid,
             video_id=video_id,
             gcs_uri=gcs_uri,
             mime_type=mime_type,
             total_duration_sec=duration_sec,
             words=words,
+            precomputed_video_embeddings=video_embeddings,
         )
 
-        print(f"[3/4] Saving {len(segments)} segments to Firestore...")
+        print(f"[3/4] Saving {len(segments)} segments to Firestore...", flush=True)
         save_segments_to_firestore(video_id=video_id, segments=segments)
 
-        print(f"[4/4] Marking video {video_id} as SUCCESSFUL...")
+        print(f"[4/4] Marking video {video_id} as SUCCESSFUL...", flush=True)
         doc_ref.update({
             "status": "SUCCESSFUL",
             "is_complete": True,
@@ -193,10 +214,10 @@ def process_video(video_id: str, uid: str) -> None:
             "error_msg": None,
             "updated_at": get_utc_now(),
         })
-        print(f"Done processing video {video_id}!")
+        print(f"Done processing video {video_id}!", flush=True)
 
     except Exception as e:
-        print(f"ERROR processing video {video_id}: {e}")
+        print(f"ERROR processing video {video_id}: {e}", flush=True)
         doc_ref.update({
             "status": "FAILED",
             "is_complete": False,
@@ -214,5 +235,4 @@ if __name__ == "__main__":
     parser.add_argument("--video-id", required=True, help="Firestore LFVideo document ID")
     parser.add_argument("--uid", required=True, help="Owner Firebase UID")
     args = parser.parse_args()
-
     process_video(video_id=args.video_id, uid=args.uid)
