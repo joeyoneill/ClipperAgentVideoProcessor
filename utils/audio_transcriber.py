@@ -114,7 +114,7 @@ def _run_batch_recognize(audio_gcs_uri: str) -> tuple[str, list[dict[str, Any]]]
             f"  [1d] Speech-to-Text V2 progress: {progress_str} (elapsed: {elapsed}s)",
             flush=True,
         )
-        time.sleep(10)
+        time.sleep(15)
     
     response = operation.result(timeout=60)
     if response is None:

@@ -6,12 +6,14 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
+import json
 import os
 from typing import Any
 
 # Local Processor Modules
 from utils.db import db
 from utils.audio_transcriber import transcribe_video_from_gcs
+from utils.storage import gcs_client
 from utils.video_embedder import build_multimodal_segments
 
 # Load Env Vars
@@ -24,8 +26,10 @@ LFVIDEO_SEGMENT_COLLECTION_NAME = os.environ['LFVIDEO_SEGMENT_COLLECTION_NAME']
 # Helper Functions
 ################################################################
 
+
 def get_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def save_segments_to_firestore(
     video_id: str,
@@ -81,6 +85,37 @@ def save_segments_to_firestore(
     if op_count > 0:
         batch.commit()
 
+
+def load_transcript_checkpoint(
+    uid: str,
+    video_id: str
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """Checks if Step 1 already saved transcript_checkpoint.json in GCS."""
+    checkpoint_path = f"{uid}/lf_videos/{video_id}/transcript_checkpoint.json"
+    bucket = gcs_client.bucket(GCS_ROOT_BUCKET_NAME)
+    blob = bucket.blob(checkpoint_path)
+    if not blob.exists():
+        return None
+    data = json.loads(blob.download_as_text())
+    return data["transcript"], data["words"]
+
+
+def save_transcript_checkpoint(
+    uid: str,
+    video_id: str,
+    full_transcript: str,
+    words: list[dict[str, Any]],
+) -> None:
+    """Saves Step 1 output to GCS so future runs skip Speech-to-Text."""
+    checkpoint_path = f"{uid}/lf_videos/{video_id}/transcript_checkpoint.json"
+    bucket = gcs_client.bucket(GCS_ROOT_BUCKET_NAME)
+    blob = bucket.blob(checkpoint_path)
+    blob.upload_from_string(
+        json.dumps({"transcript": full_transcript, "words": words}),
+        content_type="application/json",
+    )
+
+
 ################################################################
 # Core Pipeline: Transcribe -> Embed -> Index -> Update Status
 ################################################################
@@ -109,12 +144,29 @@ def process_video(video_id: str, uid: str) -> None:
         mime_type: str = video_data.get("content_type") or "video/mp4"
         duration_sec: int = int(video_data.get("duration_seconds") or 30)
 
-        print(f"[1/4] Transcribing audio & word timestamps for video {video_id}...")
-        full_transcript, words = transcribe_video_from_gcs(
-            uid=uid,
-            video_id=video_id,
-            video_blob_path=video_blob_path,
-        )
+        # Load from GCS checkpoint if it exists, otherwise run Speech-to-Text V2
+        checkpoint = load_transcript_checkpoint(uid=uid, video_id=video_id)
+        if checkpoint is not None:
+            full_transcript, words = checkpoint
+            print(
+                f"[1/4] Loaded saved transcript checkpoint from GCS "
+                f"({len(words)} words) — skipping Speech-to-Text!",
+                flush=True,
+            )
+        else:
+            print(f"[1/4] Transcribing audio & word timestamps for video {video_id}...", flush=True)
+            full_transcript, words = transcribe_video_from_gcs(
+                uid=uid,
+                video_id=video_id,
+                video_blob_path=video_blob_path,
+            )
+            # Save checkpoint to GCS & Firestore immediately so we never re-run [1/4]
+            save_transcript_checkpoint(uid, video_id, full_transcript, words)
+            doc_ref.update({
+                "transcript": full_transcript,
+                "updated_at": get_utc_now(),
+            })
+            print("[1/4] Saved transcript checkpoint to GCS & Firestore.", flush=True)
 
         # If client didn't know duration, fallback to the last spoken word's timestamp
         if not video_data.get("duration_seconds") and words:
