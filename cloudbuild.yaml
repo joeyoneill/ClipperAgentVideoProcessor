@@ -1,0 +1,100 @@
+# ==============================================================================
+# CLIP_AGENT_OS — Video Processor Cloud Run Job CI/CD (capstone_video_processor/cloudbuild.yaml)
+# ==============================================================================
+# Safe for public GitHub repositories: contains NO hardcoded project IDs,
+# service account emails, bucket names, or database names. All environment-specific
+# values are injected via Cloud Build substitution variables ($_...).
+# ==============================================================================
+
+steps:
+  # ----------------------------------------------------------------------------
+  # Step 1: Python Linting & Static Code Quality (ruff)
+  # ----------------------------------------------------------------------------
+  - id: "lint"
+    name: "ghcr.io/astral-sh/uv:python3.14-bookworm-slim"
+    entrypoint: "sh"
+    args:
+      - "-c"
+      - |
+        set -eu
+        echo "==> [1/4] Running Ruff linter across video processor source..."
+        uvx ruff check --select E9,F63,F7,F82 .
+
+  # ----------------------------------------------------------------------------
+  # Step 2: Build Versioned Docker Image (:$BUILD_ID and :latest)
+  # ----------------------------------------------------------------------------
+  - id: "docker-build"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}:${BUILD_ID}"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}:latest"
+      - "."
+    waitFor:
+      - "lint"
+
+  # ----------------------------------------------------------------------------
+  # Step 3: Push Images to Artifact Registry (Triggers Container Scanning API)
+  # ----------------------------------------------------------------------------
+  - id: "docker-push"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "--all-tags"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}"
+    waitFor:
+      - "docker-build"
+
+  # ----------------------------------------------------------------------------
+  # Step 4: Deploy / Update Cloud Run Job Configuration
+  # ----------------------------------------------------------------------------
+  - id: "deploy-job"
+    name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_URI="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}:${BUILD_ID}"
+
+        echo "==> [4/4] Deploying Cloud Run Job ${_JOB_NAME} (${BUILD_ID})..."
+        gcloud run jobs deploy "${_JOB_NAME}" \
+          --image="$${IMAGE_URI}" \
+          --region="${_REGION}" \
+          --project="${PROJECT_ID}" \
+          --network="${_VPC_NETWORK}" \
+          --subnet="${_VPC_SUBNET}" \
+          --vpc-egress=private-ranges-only \
+          --service-account="${_SERVICE_ACCOUNT_EMAIL}" \
+          --cpu=4 \
+          --memory=8Gi \
+          --task-timeout=3600s \
+          --max-retries=1 \
+          --set-secrets="GEMINI_API_KEY=${_GEMINI_SECRET_NAME}:latest" \
+          --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${_REGION},FIRESTORE_DB_NAME=${_FIRESTORE_DB_NAME},LFVIDEO_COLLECTION_NAME=lfvideos,LFVIDEO_SEGMENT_COLLECTION_NAME=lf_video_segments,GCS_ROOT_BUCKET_NAME=${_GCS_BUCKET_NAME},EMBEDDING_MODEL_NAME=${_EMBEDDING_MODEL_NAME}"
+
+        echo "==> Successfully updated Cloud Run Job: ${_JOB_NAME}"
+    waitFor:
+      - "docker-push"
+
+images:
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}:${BUILD_ID}"
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_JOB_NAME}:latest"
+
+substitutions:
+  _REGION: "us-central1"
+  _AR_REPO: "your-artifact-repo"
+  _JOB_NAME: "your-video-processor-job"
+  _VPC_NETWORK: "your-vpc-network"
+  _VPC_SUBNET: "your-vpc-subnet"
+  _SERVICE_ACCOUNT_EMAIL: "your-backend-sa@your-project-id.iam.gserviceaccount.com"
+  _FIRESTORE_DB_NAME: "your-firestore-db"
+  _GCS_BUCKET_NAME: "your-gcs-bucket"
+  _EMBEDDING_MODEL_NAME: "gemini-embedding-2"
+  _GEMINI_SECRET_NAME: "GEMINI_API_KEY"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE

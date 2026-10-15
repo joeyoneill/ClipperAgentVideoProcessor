@@ -1,0 +1,15 @@
+# ==============================================================================
+# Video Processor .gcloudignore (capstone_video_processor)
+# Excludes local .venv, .git, and .env files from Cloud Build upload.
+# ==============================================================================
+
+.gcloudignore
+.DS_Store
+.git/
+.venv/
+__pycache__/
+*.py[oc]
+.env
+*.env
+*.ipynb
+transcriptions/
